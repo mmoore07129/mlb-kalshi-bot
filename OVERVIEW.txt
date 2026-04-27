@@ -524,7 +524,7 @@ View: ssh in, then `crontab -u kalshi -l` or
 
   .env                                KALSHI_KEY_ID, ODDS_API_KEY   (chmod 600)
   credentials/kalshi_private_key.txt  Kalshi RSA private key         (chmod 600)
-  ~/.ssh/kalshi_deploy                Claude's server SSH key (local-only)
+  ~/.ssh/<deploy-key>                 Server SSH key (local-only)
 
 The Kalshi private key is the only truly sensitive file in the project tree.
 On the server it's owned by kalshi:kalshi, perms 600. Do not scp it to /tmp
