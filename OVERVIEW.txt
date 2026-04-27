@@ -1,0 +1,639 @@
+═══════════════════════════════════════════════════════════════════════════════
+  MLB KALSHI BOT — COMPLETE OVERVIEW
+  Generated 2026-04-23 · Updated 2026-04-27 (flat-unit sizing, 0.5% gate)
+═══════════════════════════════════════════════════════════════════════════════
+
+Everything this bot is, head to toe. Sectioned for reference; read top-to-bottom
+the first time through.
+
+
+╔═════════════════════════════════════════════════════════════════════════════╗
+║  1. WHAT IT DOES                                                            ║
+╚═════════════════════════════════════════════════════════════════════════════╝
+
+An automated MLB betting bot trading event contracts on Kalshi's KXMLBGAME
+moneyline market. On each MLB game day it:
+
+  1. Fetches vig-free probability blends from sharp bookmakers (Pinnacle,
+     LowVig, BetOnline) via The Odds API.
+  2. Runs an XGBoost model as a secondary signal — used to confirm or veto
+     each Pinnacle-sourced bet, plus as a standalone fallback when no sharp
+     line is available.
+  3. Checks Kalshi's orderbook for each game, computes net-of-fee expected
+     value (EV) on both sides at the current ask.
+  4. Places YES buy orders when edge clears a dynamic threshold, sized as a
+     flat dollar unit per bet (no Kelly).
+  5. Stays alive in watch mode, amending resting orders if prices drift and
+     cancelling them if EV turns negative.
+  6. Settles outstanding bets against Kalshi (cross-checked vs. MLB API) the
+     following morning, logging realized PnL to the ledger.
+
+Kalshi is the ONLY venue. Only moneyline (KXMLBGAME) is supported — Kalshi
+doesn't list run line / totals / F5 / props for MLB. Sizing is a flat $10
+per qualifying bet, sized to the current ~$30 bankroll for a data-collection
+phase under the new 0.5% EV gate.
+
+
+╔═════════════════════════════════════════════════════════════════════════════╗
+║  2. DESIGN PHILOSOPHY                                                       ║
+╚═════════════════════════════════════════════════════════════════════════════╝
+
+PINNACLE-PRIMARY, MODEL-VETO/FALLBACK.
+
+The core architectural choice: Pinnacle's blended sharp probability is the
+primary betting signal. The XGBoost model is a secondary check, used to:
+  - Veto Pinnacle-sourced bets when the model doesn't also see +EV at ask
+    (catches cases where the book priced info the model missed, or vice versa)
+  - Gap-veto entire games when model and Pinnacle disagree by >20%
+  - Fall back to model-only when Pinnacle has no line, with stricter gates
+
+This bounds theoretical upside (we can't beat Pinnacle's closing line) but
+maximizes robustness. Considered and rejected: trusting the model more. The
+model's features (team Pythagorean, Log5, SP rolling stats) are strictly a
+subset of what Pinnacle incorporates. Trusting the model to overrule Pinnacle
+is a long-run losing strategy.
+
+KALSHI IS TIGHT ON MLB MONEYLINES. Empirically, Kalshi's ask typically sits
+1–2¢ above Pinnacle fair. Add the quadratic fee (~1.5¢ effective) and the
+distribution of best_ev across the slate clusters tightly around 0%, with
+most games landing between -3% and 0%. Under the original 3% gate, 0–1 bets
+per slate was the norm.
+
+THIN-EDGE PHASE (2026-04-27 →). The EV gate was lowered from 2.5% (dynamic
+floor) to 0.5% to start collecting actual placed-bet data on the gap↔EV
+correlation hypothesis: that high model-vs-market gap rows tend to also be
+the highest-EV ones. Individual 0.5% bets are nearly coin flips on expected
+value (calibration noise dominates the displayed edge), so this phase is
+explicitly a data-collection bet, not a high-confidence growth strategy.
+Expect ~1 bet per slate at this gate, $10 each, at $30 bankroll = three
+losses in a row would zero the bankroll — risk is real and acknowledged.
+
+
+╔═════════════════════════════════════════════════════════════════════════════╗
+║  3. ARCHITECTURE (FILE BY FILE)                                             ║
+╚═════════════════════════════════════════════════════════════════════════════╝
+
+  main.py                  Entry point. Orchestrates the daily placement loop.
+  config.py                Trading parameters (FLAT_UNIT_DOLLARS, EV thresholds,
+                           MLB_SEASON, Kalshi URLs, .env loading).
+  risk.py                  Net-of-fee EV calc and flat-unit sizing. Implements
+                           Kalshi's quadratic fee formula:
+                           fee = QUADRATIC_BASE × multiplier × P × (1-P).
+                           Exports calculate_ev() and flat_unit_contracts().
+  ledger.py                Bet/outcome/CLV CSV ledger at logs/ledger.csv.
+                           record_bet / record_clv / record_outcome functions.
+                           Auto-migrates schema on header change.
+  settle.py                End-of-day settler. Pulls Kalshi settlements,
+                           cross-checks against MLB final scores, writes
+                           realized PnL + prints CLV breakdown.
+  watcher.py               Post-placement order watcher. Polls every 3 min
+                           after placement, amends orders when ask moves ≥2¢,
+                           cancels when EV drops below the per-order threshold.
+  clv_snapshot.py          Standalone script, runs every 5 min via cron during
+                           game windows. For each unsettled today-dated bet,
+                           fetches current sharp-book blend and overwrites CLV.
+                           Last pre-lockout write freezes as the close.
+  daily_stats.py           Per-game decision diagnostics written to
+                           logs/daily_stats.csv. Answers "why isn't the bot
+                           betting?" without grepping session logs.
+
+  kalshi/
+    client.py              Kalshi HTTP client with RSA-signed requests.
+    markets.py             Helpers for KXMLBGAME markets, prices, order
+                           placement, cancellation, amendment, settlements.
+    auth.py                RSA signature generation for Kalshi API auth.
+
+  data/
+    mlb_fetcher.py         MLB Stats API helpers: teams, schedules, probable
+                           pitchers, per-pitcher game logs (with disk cache).
+    game_logs.py           Historical game + pitcher fetch and rolling-stat
+                           computation. Builds the full training dataset AND
+                           current-season inference stats. Leakage-free.
+    odds.py                Sharp-book blend via The Odds API. Pinnacle 0.55 +
+                           LowVig 0.30 + BetOnline 0.15 weights. De-vigs and
+                           returns {(away,home): {home_prob, away_prob,
+                           prob_std, books_used}}.
+
+  models/
+    train.py               XGBoost training pipeline. 5-fold CV + walk-forward
+                           held-out-year test + isotonic calibration. Saves
+                           to xgb_model.pkl.
+    predictor.py           Inference wrapper. Loads pickled model, computes
+                           feature vector, returns calibrated p_home.
+    xgb_model.pkl          Trained + calibrated model (current: SP-aware +
+                           sp_is_prior flag, 53 features, built 2026-04-23).
+    xgb_model.pre_sp.pkl   Backup: pre-SP-feature model (team-only).
+    xgb_model.sp_v1.pkl    Backup: first SP-feature model, no is_prior flag.
+
+  credentials/
+    kalshi_private_key.txt RSA private key for Kalshi API auth. chmod 600.
+
+  state/
+    pitcher_logs/          JSON cache of per-pitcher season game logs.
+                           ~3771 files after first full retrain. Eliminates
+                           API refetch on subsequent training runs. Current-
+                           season caches refresh on demand.
+
+  logs/
+    bot_YYYYMMDD_HHMMSS.log     Per-session detailed logs.
+    cron.log                    Aggregated cron job output (append-only).
+    ledger.csv                  Bet history (24 columns).
+    daily_stats.csv             Per-game decision diagnostics (23 columns).
+
+  .env                     KALSHI_KEY_ID, ODDS_API_KEY. chmod 600.
+  requirements.txt         Python deps.
+  run.bat, run_dry.bat, run_watch.bat, train.bat, settle.bat, setup.bat,
+  clv_snapshot.bat         Windows batch wrappers for local runs.
+
+
+╔═════════════════════════════════════════════════════════════════════════════╗
+║  4. THE MODEL                                                               ║
+╚═════════════════════════════════════════════════════════════════════════════╝
+
+ARCHITECTURE: XGBoost binary classifier, calibrated via isotonic regression
+(CalibratedClassifierCV with 5-fold CV). Predicts P(home team wins).
+
+TRAINING DATA: 2015–2025 regular-season games from MLB Stats API. 24,686
+total games, 23,817 after 5-game-minimum filter. 5-fold stratified CV, then
+walk-forward test on held-out final year, then final fit on full data.
+
+FEATURES (53 total in current model):
+
+  Team (20):
+    home/away YTD:    wins, losses, win_pct, pythagorean
+    home/away L5:     wins, losses, win_pct, pythagorean
+    combined:         pyth_delta, log5, r5_pyth_delta, r5_log5
+
+  SP — home/away L5 (12):
+    era, whip, k_pct, bb_pct, k_bb_pct, hr_per_9
+
+  SP — home/away YTD (8):
+    era, whip, k_pct, bb_pct
+
+  SP — context (6):
+    days_rest, starts_ytd, is_prior (1=rookie/early-season; league-avg fallback)
+
+  SP — matchup deltas (7):
+    l5_era_delta, l5_whip_delta, l5_k_pct_delta, l5_bb_pct_delta,
+    l5_k_bb_pct_delta, ytd_era_delta, ytd_k_pct_delta
+
+  Note: home_r5_win_pct dropped to 0.0000 importance — collinear with
+  wins/losses. away_sp_is_prior also 0.0000 — XGBoost captured the rookie
+  signal via home_sp_is_prior alone. Harmless; no pruning needed yet.
+
+LEAKAGE DISCIPLINE: rolling stats computed BEFORE each game only. For game i,
+all inputs derive from games 0..i-1. Prior-fallback (league average) used when
+fewer than 3 prior starts exist for a pitcher — flagged via sp_is_prior.
+
+CURRENT PERFORMANCE (held-out 2025 walk-forward):
+  Overall CV: 56.0% ± 0.5% accuracy, logloss 0.685
+  ≥60% conf: 56.6% acc (n=799)
+  ≥63% conf: 60.0% acc (n=512)
+  ≥66% conf: 65.9% acc (n=323)
+
+KEY INSIGHT: team features still dominate (log5 + pyth_delta = top 2). SP
+features added real but modest lift — ~1.5pp at high confidence levels.
+The sp_is_prior flag specifically fixed the MIN@NYM-type case where a rookie
+home starter's 4.30-ERA prior was getting compared to a real 3.29 away
+starter, falsely inflating away-team prediction.
+
+LIMITATIONS (known, not yet addressed):
+  - No park factors
+  - No weather
+  - No bullpen state
+  - No umpire tendencies
+  - No sp_small_sample flag for 3–5 start pitchers with extreme early numbers
+    (caused NYY@BOS 12.7% gap from Schlittler's 1.95 ERA on ~3 starts)
+
+
+╔═════════════════════════════════════════════════════════════════════════════╗
+║  5. STAKING MATH                                                            ║
+╚═════════════════════════════════════════════════════════════════════════════╝
+
+EV is computed NET of Kalshi's quadratic taker fee. Sizing is flat-unit —
+every bet that passes the gate is the same dollar amount, regardless of edge.
+
+FEE FORMULA (empirically verified against real settlements):
+  per-contract fee = 0.07 × fee_multiplier × P × (1 - P)
+
+  fee_multiplier is pulled live from GET /series/KXMLBGAME at each run.
+  MLB markets use multiplier = 1.0. Fallback to 0.07 if the request fails.
+
+NET EV:
+  b_gross = (1 - price) / price           # gross decimal odds from Kalshi price
+  fee_rate_on_winnings = 0.07 × multiplier × price
+  b_net = b_gross × (1 - fee_rate_on_winnings)
+  EV = p_model × b_net − (1 − p_model)
+
+FLAT-UNIT SIZING:
+  contracts = floor(FLAT_UNIT_DOLLARS / ask_price)
+  cost      = contracts × ask_price
+  (Returned by risk.flat_unit_contracts(); see also gates below.)
+
+  FLAT_UNIT_DOLLARS = 10.00.
+  Rationale for switching from 1/8 Kelly → flat unit (2026-04-27):
+    - At low bankroll ($30), 1/8 Kelly stake on a 0.5% edge rounds to <$1 →
+      MIN_BET_DOLLARS gate fires, bot never actually bets.
+    - Flat unit is simpler to reason about; every passing bet is a known
+      $10 commitment. Useful for a data-collection phase.
+    - Trade-off: per-bet exposure jumped from ≤10% of bankroll (Kelly cap)
+      to 33% of bankroll. Three consecutive losses ≈ ruin. Expected to be
+      revisited once bankroll grows or once the gap↔EV correlation is
+      validated/refuted.
+
+ACTIVE GATES (applied around the unit):
+  MIN_BET_DOLLARS = 1.00   — sanity floor; effectively dead at $10 unit
+  available_cash           — bankroll − this-session resting cost; can't
+                             over-spend across multiple games per session
+  depth_cap                = Kalshi top-of-book depth for chosen side
+                             (prevents walking the book 3–5¢ past quoted ask)
+
+REMOVED 2026-04-27 (no longer in code):
+  KELLY_FRACTION, MAX_BET_FRACTION, MAX_SESSION_EXPOSURE_FRACTION,
+  risk.kelly_contracts(), risk.check_session_exposure().
+
+
+╔═════════════════════════════════════════════════════════════════════════════╗
+║  6. GATES & THRESHOLDS                                                      ║
+╚═════════════════════════════════════════════════════════════════════════════╝
+
+DYNAMIC EV THRESHOLD (for Pinnacle-primary bets, ≥2 sharp books):
+  threshold = clamp(0.005 + 1.5 × prob_std, 0.005, 0.08)
+
+  When sharp books agree (low std), threshold falls toward the 0.5% floor.
+  When they disagree (high std), threshold rises up to an 8% ceiling. This
+  is in-flight calibration of confidence in the blend.
+
+  (Floor was 2.5% prior to 2026-04-27; lowered to 0.5% to start collecting
+  placed-bet data on thin edges. The dynamic ceiling response is unchanged.)
+
+STATIC THRESHOLDS:
+  PINNACLE_MIN_EV       = 0.005  — single-sharp-book path (only 1 book quoted)
+                                   (was 0.03 before 2026-04-27)
+  MODEL_MIN_EV          = 0.08   — model fallback when no Pinnacle at all
+                                   (kept strict; respects Pinnacle-primary
+                                   hierarchy when only model signal available)
+  CONFIDENCE_THRESHOLD  = 0.55   — model-only: stronger side must clear this
+
+MODEL-PINNACLE GAP VETO:
+  MODEL_PINNACLE_GAP_MAX = 0.20
+
+  If |p_model_home − p_pinnacle_home| > 20%, skip the game entirely. Assumes
+  Pinnacle knows something the model doesn't (scratch, lineup, weather,
+  bullpen). Safer to sit out than trust either signal alone.
+
+MODEL VETO ON PINNACLE BETS:
+  When a Pinnacle-sourced bet would fire, also require model_p for the bet
+  side to be ≥ Kalshi ask. Catches cases where Pinnacle's price already
+  reflects breaking news the model didn't see — we'd be buying stale edge.
+
+GATES IN ORDER, PER GAME:
+  1. already have position           → skip (reason=already-positioned)
+  2. team stats missing              → skip (reason=missing-stats)
+  3. model-Pinnacle gap > 20%        → skip (reason=model-pin-gap)
+  4. no Pinnacle + confidence < 55%  → skip (reason=confidence-gate)
+  5. no Kalshi orderbook             → skip (reason=no-orderbook)
+  6. no side clears EV threshold     → skip (reason=no-edge)
+  7. winning side's model_p < ask    → skip (reason=model-veto-{home,away})
+  8. available_cash < unit floor     → skip (reason=insufficient-cash)
+  9. place_order returned falsy      → skip (reason=place-failed)
+ 10. otherwise                       → placed (reason=placed)
+
+(Gates 8 "session-cap" and 9 "kelly-zero" from the prior version were
+removed with the Kelly system on 2026-04-27. Insufficient-cash now subsumes
+both — it fires when this-session resting orders have exhausted bankroll
+below the next $10 unit.)
+
+
+╔═════════════════════════════════════════════════════════════════════════════╗
+║  7. WATCH MODE                                                              ║
+╚═════════════════════════════════════════════════════════════════════════════╝
+
+After placement (if --watch flag set, or cron equivalent), main.py enters
+watcher.watch_and_amend(), which polls every 3 min (WATCH_INTERVAL_SECONDS)
+until all games on active orders have started.
+
+Per active order:
+  1. Query Kalshi for order status; drop from active list if not 'resting'.
+  2. Refresh Pinnacle blend every 10 min (to reduce API calls).
+  3. Recompute EV at current ask using current Pinnacle prob (or stored p_used
+     if the game fell off the Pinnacle feed).
+  4. If EV < per-order ev_threshold (the dynamic threshold that admitted the
+     bet at placement), CANCEL the order.
+  5. If ask moved ≥ 2¢ (WATCH_AMEND_TICK_THRESHOLD) in either direction,
+     AMEND the resting price to follow the market.
+
+PER-ORDER THRESHOLD MEMORY: the dynamic EV threshold that admitted each bet
+is stored on the active_orders entry. Watch mode compares against THAT, not
+a fresh recomputation — otherwise an order placed at a permissive 2.5%
+threshold could be unfairly cancelled by a stricter live recomputation, and
+vice versa.
+
+
+╔═════════════════════════════════════════════════════════════════════════════╗
+║  8. CLV TRACKING                                                            ║
+╚═════════════════════════════════════════════════════════════════════════════╝
+
+Closing Line Value measures "did the market move toward our pick?" It's the
+leading indicator of real edge; positive PnL with zero CLV means hot streak,
+not skill. Target: +1% rolling mean confirms edge at n≈300; +2% at n≈150.
+
+CAPTURE (standalone cron every 5 min, 11 AM–midnight ET):
+  clv_snapshot.py scans ledger.csv for today-dated unsettled bets. For each,
+  looks up the (away_code, home_code) match in the current sharp-book blend.
+  If the game is still in the feed (pre-first-pitch), overwrites the row's
+  CLV columns. Once the game locks (disappears from the feed), no further
+  snapshots fire — the last-written value becomes the de-facto close.
+
+DATE FILTER: only today-ET rows are considered. Past-dated rows missing CLV
+are logged but skipped — historical closing lines aren't retrievable from
+The Odds API free tier.
+
+METRICS:
+  clv_prob = p_close_fair_our_side − p_used_at_bet
+             (probability-space line movement; +ve = market moved toward us)
+
+  clv_pct  = (1/bet_price) / (1/p_close_fair_our_side) − 1
+             (ROI-space; our entry odds vs market close)
+
+  For Pinnacle-sourced bets, p_used IS the vig-free blend at bet time, so
+  clv_prob measures clean market-movement CLV. For model-sourced bets,
+  p_used is the model prob; clv_prob then measures "did the market agree
+  with what my model predicted."
+
+REPORTING: settle.py's print_summary now includes a CLV SUMMARY section:
+  - Mean clv_prob, clv_pct
+  - Rolling-100 mean clv_prob
+  - Breakdown by prob_src (Pinnacle / Blend / model)
+  - Breakdown by edge-bucket (0–3%, 3–4%, ..., 6%+)
+
+
+╔═════════════════════════════════════════════════════════════════════════════╗
+║  9. SETTLEMENT                                                              ║
+╚═════════════════════════════════════════════════════════════════════════════╝
+
+settle.py runs every morning at 2 AM ET via cron. For each unsettled ledger
+row:
+
+  1. Fetch Kalshi's /portfolio/settlements for the row's ticker. Skip if
+     Kalshi hasn't settled yet.
+  2. Parse market_result: 'yes' / 'no' / 'void' / 'scalar' (unexpected).
+  3. Use Kalshi's reported fee_cost (actual, not computed) for precise PnL:
+     - win: gross = contracts × (1 − price); pnl = gross − fee_cost
+     - loss: pnl = -contracts × price
+     - void: pnl = -fee_cost (usually $0)
+  4. Cross-check against MLB Stats API's Final winner for that game date.
+     Log any divergence but trust Kalshi's result.
+  5. Call ledger.record_outcome() to close the row.
+
+After settlement pass, print_summary() renders:
+  - Wins/losses/voids
+  - Win rate (excluding voids)
+  - Wagered, net PnL, ROI
+  - By-date breakdown
+  - CLV summary (as detailed above)
+
+
+╔═════════════════════════════════════════════════════════════════════════════╗
+║  10. LEDGER SCHEMA (logs/ledger.csv)                                        ║
+╚═════════════════════════════════════════════════════════════════════════════╝
+
+24 columns. Auto-migrates when FIELDNAMES changes — legacy rows get new
+columns filled with empty strings.
+
+  timestamp            — placement time (local)
+  game_date            — YYYY-MM-DD
+  home_team, away_team — MLB abbreviations
+  bet_label            — "<CODE> wins" (human-readable)
+  bet_team_code        — Kalshi code of bet team (parse-safe)
+  ticker               — KXMLBGAME-YYMONDDHHMM<AWAY><HOME>-<BETTEAM>
+  side                 — always 'yes' in this bot
+  contracts, price     — size + per-contract price
+  cost                 — contracts × price (actual stake)
+  ev                   — net-of-fee EV at placement
+  p_used               — probability used at bet (Pinnacle blend or model)
+  model_p_home         — model's p_home (for audit; may differ from p_used)
+  prob_src             — 'Pinnacle' / 'Blend' / 'model'
+  order_id             — Kalshi order_id (or 'DRY_RUN' sentinel)
+  outcome              — 'win' / 'loss' / 'void' / '' (pending)
+  pnl                  — realized dollar PnL (after fees)
+
+  CLV columns (populated later by clv_snapshot.py):
+    close_home_prob, close_away_prob   — snapshotted sharp blend
+    close_prob_src                     — 'Blend' / 'Pinnacle'
+    close_snapshot_time                — when the latest snapshot fired
+    clv_prob                           — p_close_our_side − p_used
+    clv_pct                            — (your_dec / close_dec) − 1
+
+
+╔═════════════════════════════════════════════════════════════════════════════╗
+║  11. DAILY STATS (logs/daily_stats.csv)                                     ║
+╚═════════════════════════════════════════════════════════════════════════════╝
+
+One row per game analyzed per live session. 23 columns. Only written in
+live mode (--dry-run skips the write so test iterations don't pollute data).
+
+Columns: timestamp, mode, game_date, away_code, home_code, away_sp, home_sp,
+model_p_home, pin_home_prob, pin_src, pin_std, model_pin_gap, ev_threshold,
+kalshi_home_ask, kalshi_away_ask, ev_home_net, ev_away_net, best_ev, reason,
+bet_contracts, bet_price, bet_cost, order_id.
+
+Reason values (see gates order in §6): placed, no-edge, model-veto-home,
+model-veto-away, model-pin-gap, confidence-gate, missing-stats, no-orderbook,
+insufficient-cash, already-positioned, place-failed.
+
+Purpose: after a week of runs, answer diagnostically:
+  - Distribution of best_ev across rejected games
+  - Rejection reason counts (is any gate over-firing?)
+  - Avg Kalshi-vs-Pinnacle spread per day
+  - Whether the 0.5% threshold yields meaningful placed-bet flow, and
+    whether high-model-gap rows correlate with high best_ev (the hypothesis
+    motivating the 2026-04-27 gate drop).
+
+
+╔═════════════════════════════════════════════════════════════════════════════╗
+║  12. DEPLOYMENT                                                             ║
+╚═════════════════════════════════════════════════════════════════════════════╝
+
+TWO LOCATIONS — HARD SYNC RULE: local and server must reflect identical code.
+Every edit propagates to both.
+
+LOCAL (Windows):
+  C:\Users\maxxw\Desktop\MLB KALSHI BOT POWERSHELL\
+  Python 3.12.10 at C:\Users\maxxw\AppData\Local\Programs\Python\Python312\
+  Invoke via .bat files (double-click or from cmd.exe):
+    run.bat, run_dry.bat, run_watch.bat, train.bat, settle.bat,
+    clv_snapshot.bat, setup.bat
+
+  HARD RULE: do not use WSL for this bot. WSL DNS flakes during long training
+  runs silently poisoned the pitcher cache once; native Windows avoids it.
+
+SERVER (Ubuntu 24.04 droplet, DigitalOcean):
+  Host:            Cortex @ <DROPLET_IP>
+  OS:              Ubuntu 24.04.3 LTS, timezone America/New_York
+  Project path:    /opt/mlb-kalshi-bot
+  Service user:    kalshi (uid 1001)
+  Python env:      /opt/mlb-kalshi-bot/venv (Python 3.12.3)
+  SSH access:      ssh -i "~/.ssh/<deploy-key>" root@<DROPLET_IP>
+
+  Note: this server can host multiple bots. Convention for additional bots:
+  install to /opt/<bot-name>/, service user <bot-name>, venv at
+  /opt/<bot-name>/venv. Add per-bot crontab via `crontab -u <bot-name> -e`.
+
+SYNCING LOCAL → SERVER (tar-piped over ssh, excludes pycache/logs/pkl backups):
+  cd "C:/Users/maxxw/Desktop/MLB KALSHI BOT POWERSHELL" && \
+  tar czf - --exclude='__pycache__' --exclude='*.pyc' \
+    --exclude='logs/bot_*.log' \
+    --exclude='models/xgb_model.pre_sp.pkl' \
+    --exclude='models/xgb_model.sp_v1.pkl' . | \
+  ssh -i ~/.ssh/<deploy-key> root@<DROPLET_IP> \
+    'tar xzf - -C /opt/mlb-kalshi-bot && chown -R kalshi:kalshi /opt/mlb-kalshi-bot'
+
+Single-file push:
+  scp -i ~/.ssh/<deploy-key> \
+    "<local-file>" root@<DROPLET_IP>:/tmp/ && \
+  ssh -i ~/.ssh/<deploy-key> root@<DROPLET_IP> \
+    "mv /tmp/<file> /opt/mlb-kalshi-bot/<path> && chown kalshi:kalshi ..."
+
+
+╔═════════════════════════════════════════════════════════════════════════════╗
+║  13. SCHEDULING                                                             ║
+╚═════════════════════════════════════════════════════════════════════════════╝
+
+Crontab installed for kalshi user (times are America/New_York):
+
+  # Morning placement — fetch odds, place bets, enter watch mode
+  0 9 * * *        cd /opt/mlb-kalshi-bot && ./venv/bin/python main.py --watch
+                   >> logs/cron.log 2>&1
+
+  # CLV snapshot — every 5 min during game window
+  */5 11-23 * * *  cd /opt/mlb-kalshi-bot && ./venv/bin/python clv_snapshot.py
+                   >> logs/cron.log 2>&1
+
+  # Overnight settlement + performance summary
+  0 2 * * *        cd /opt/mlb-kalshi-bot && ./venv/bin/python settle.py
+                   >> logs/cron.log 2>&1
+
+View: ssh in, then `crontab -u kalshi -l` or
+      `tail -f /opt/mlb-kalshi-bot/logs/cron.log`
+
+
+╔═════════════════════════════════════════════════════════════════════════════╗
+║  14. SECRETS & CREDENTIALS                                                  ║
+╚═════════════════════════════════════════════════════════════════════════════╝
+
+  .env                                KALSHI_KEY_ID, ODDS_API_KEY   (chmod 600)
+  credentials/kalshi_private_key.txt  Kalshi RSA private key         (chmod 600)
+  ~/.ssh/kalshi_deploy                Claude's server SSH key (local-only)
+
+The Kalshi private key is the only truly sensitive file in the project tree.
+On the server it's owned by kalshi:kalshi, perms 600. Do not scp it to /tmp
+without chmod'ing immediately after the move.
+
+
+╔═════════════════════════════════════════════════════════════════════════════╗
+║  15. CURRENT STATE (as of 2026-04-27 afternoon)                             ║
+╚═════════════════════════════════════════════════════════════════════════════╝
+
+Bankroll (live):              $29.40 reported by Kalshi at last session,
+                              with $9.99 committed to today's resting MIA
+                              order. Effective spendable: ~$19.40.
+                              History: started 2026-04-23 deployment at
+                              $113.65, user withdrew most of it on 2026-04-24/25,
+                              redeposited $30 on 2026-04-27.
+Active config:                FLAT_UNIT_DOLLARS = 10.00
+                              EV_THRESHOLD_BASE = 0.005 (0.5% floor)
+                              PINNACLE_MIN_EV   = 0.005
+                              MODEL_MIN_EV      = 0.08 (unchanged)
+Model version:                xgb_model.pkl (SP-aware + sp_is_prior), 53 feats
+                              (unchanged from 2026-04-23)
+Ledger:                       27 rows total (10 real bets, 17 dry-run)
+                              The 10th real bet is today's MIA bet (live).
+
+Real betting history:
+  April 20–21:                9 bets, 5W/4L, +$6.24 (pre-SP model, pre-CLV)
+  April 24–26:                0 bets — bot ran but every game's EV was below
+                              the (then) 2.5% gate. Pinnacle-tracking design
+                              behaving exactly as predicted.
+  April 27 (today):           1 live bet — MIA YES x37 @ $0.28 ($9.99 cost),
+                              order 67087a3f-68a4-4209-8f10-abca5d1c9e84,
+                              MIA @ LAD 10:10 PM ET. Model gap 13.0% (largest
+                              on the slate); +0.8% net EV at $0.27 quoted ask.
+                              First bet under the new flat-unit / 0.5% gate.
+
+CLV coverage:                 1 today-dated row eligible. clv_snapshot.py
+                              (every 5 min, 11 AM–midnight ET) will populate
+                              its CLV columns until LAD-MIA leaves the sharp
+                              feed at first pitch. First real CLV data point
+                              for the system. Prior 9 bets pre-date CLV
+                              scaffolding and are permanently un-backfillable
+                              — clv_snapshot.py logs them silently at DEBUG
+                              now (was INFO; demoted 2026-04-27 to stop
+                              flooding cron.log).
+daily_stats.csv:              ~30 rows now (Apr 24, 25, 27 slates).
+
+Next scheduled events:
+  Today 22:10 ET                  MIA @ LAD first pitch — CLV freezes
+  Tomorrow 02:00 ET               settle.py settles MIA bet, prints summary
+  Tomorrow 09:00 ET               regular cron resumes (untouched)
+
+
+╔═════════════════════════════════════════════════════════════════════════════╗
+║  16. DEFERRED / PLANNED WORK                                                ║
+╚═════════════════════════════════════════════════════════════════════════════╝
+
+Not blocking the current run cadence, queued for future iterations:
+
+  - Gap↔EV correlation analysis: once daily_stats.csv has enough rows
+    (target ~100), compute correlation between model_pin_gap and best_ev to
+    validate or refute the hypothesis that motivated the 2026-04-27 gate
+    drop. If unsupported, raise the gate back up; if supported, consider a
+    gap-aware threshold.
+  - Watch-mode CLV capture (cleaner T-0 snapshot vs. the 5-min cron approach)
+  - Calibration bucket drift detector (bucket p_predicted vs. outcomes in
+    5pp bins; pause + audit when drift exceeds tolerance)
+  - Drawdown governor (flat-unit version): halve unit ($10→$5) at -15% from
+    a high-water mark, pause + audit at -25%. Especially relevant under the
+    aggressive 33%-of-bankroll-per-bet exposure profile.
+  - Edge-bucket CLV unlock: data-driven per-bucket threshold tuning after
+    ~300 bets accumulate
+  - sp_small_sample flag: covers 3–5 start pitchers whose early numbers
+    are unreliable (caused Schlittler-type spurious gaps)
+  - Park factors / weather / bullpen state / umpire tendencies
+
+
+╔═════════════════════════════════════════════════════════════════════════════╗
+║  17. COMMON OPERATIONAL COMMANDS                                            ║
+╚═════════════════════════════════════════════════════════════════════════════╝
+
+LOCAL:
+  Dry run:            C:\Users\maxxw\Desktop\MLB KALSHI BOT POWERSHELL\run_dry.bat
+  Live (rare):        run.bat
+  Live + watch:       run_watch.bat
+  Train:              train.bat
+  Settle:             settle.bat
+
+SERVER:
+  SSH in:
+    ssh -i "~/.ssh/<deploy-key>" root@<DROPLET_IP>
+
+  Once SSH'd in:
+    crontab -u kalshi -l                         # see scheduled jobs
+    tail -f /opt/mlb-kalshi-bot/logs/cron.log    # watch live
+    sudo -u kalshi cat /opt/mlb-kalshi-bot/logs/ledger.csv
+    sudo -u kalshi cat /opt/mlb-kalshi-bot/logs/daily_stats.csv
+    cd /opt/mlb-kalshi-bot && \
+      sudo -u kalshi ./venv/bin/python settle.py       # manual settle
+    cd /opt/mlb-kalshi-bot && \
+      sudo -u kalshi ./venv/bin/python main.py --dry-run
+    cd /opt/mlb-kalshi-bot && \
+      sudo -u kalshi ./venv/bin/python clv_snapshot.py # manual CLV snap
+
+DIAGNOSTICS:
+  tail /opt/mlb-kalshi-bot/logs/bot_$(date +%Y%m%d)_*.log
+  tail /opt/mlb-kalshi-bot/logs/cron.log
+  journalctl -u cron --since 'today' --no-pager
+
+═══════════════════════════════════════════════════════════════════════════════
+  END OVERVIEW
+═══════════════════════════════════════════════════════════════════════════════
