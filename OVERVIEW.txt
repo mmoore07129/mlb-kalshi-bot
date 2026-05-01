@@ -38,20 +38,36 @@ phase under the new 0.5% EV gate.
 ║  2. DESIGN PHILOSOPHY                                                       ║
 ╚═════════════════════════════════════════════════════════════════════════════╝
 
-PINNACLE-PRIMARY, MODEL-VETO/FALLBACK.
+PINNACLE-PRIMARY, MODEL-FALLBACK-ONLY.
 
 The core architectural choice: Pinnacle's blended sharp probability is the
-primary betting signal. The XGBoost model is a secondary check, used to:
-  - Veto Pinnacle-sourced bets when the model doesn't also see +EV at ask
-    (catches cases where the book priced info the model missed, or vice versa)
-  - Gap-veto entire games when model and Pinnacle disagree by >20%
-  - Fall back to model-only when Pinnacle has no line, with stricter gates
+primary betting signal. As of 2026-05-01, the XGBoost model has NO veto power
+on Pinnacle-sourced bet selection. It serves only two roles:
+  - Fallback to model-only when Pinnacle has no line (with stricter gates)
+  - Circuit-breaker on catastrophic model failure (gap > 50pp), as a data-
+    quality sanity check, NOT a forecast-quality gate
+
+The 2024-2025 model-vs-Pinnacle CLV backtest (analysis/model_vs_pinnacle_clv.py
+and analysis/inversion_check.py) showed the model is GLOBALLY well-calibrated
+but LOCALLY anti-calibrated specifically on disagreement games. When the model
+and the Pinnacle blend pick OPPOSITE sides:
+  - At ≥10pp gap: blend wins 59% of head-to-head
+  - At ≥15pp gap: blend wins 64%
+  - At ≥20pp gap: blend wins 77%
+  - At ≥25pp gap: blend wins 85%
+
+The original 20pp gap-veto and the directional model_p ≥ ask veto were
+rejecting exactly the games where Pinnacle is most reliable. Removing them
+corrects a known false-veto failure mode. Expected ROI uplift is unknown
+until forward-going daily_stats data accumulates (target: 60 days) — we
+removed false vetoes but haven't established that Kalshi actually misprices
+the games we'll now be eligible to bet on.
 
 This bounds theoretical upside (we can't beat Pinnacle's closing line) but
 maximizes robustness. Considered and rejected: trusting the model more. The
 model's features (team Pythagorean, Log5, SP rolling stats) are strictly a
 subset of what Pinnacle incorporates. Trusting the model to overrule Pinnacle
-is a long-run losing strategy.
+is a long-run losing strategy — empirically verified at all gap levels.
 
 KALSHI IS TIGHT ON MLB MONEYLINES. Empirically, Kalshi's ask typically sits
 1–2¢ above Pinnacle fair. Add the quadratic fee (~1.5¢ effective) and the
@@ -93,6 +109,23 @@ losses in a row would zero the bankroll — risk is real and acknowledged.
                            game windows. For each unsettled today-dated bet,
                            fetches current sharp-book blend and overwrites CLV.
                            Last pre-lockout write freezes as the close.
+  snapshot_all_analyzed.py Same cadence as clv_snapshot.py, but snapshots
+                           Pinnacle for ALL games the bot analyzed today —
+                           not just placed bets. Writes append-only to
+                           logs/all_games_clv.csv. Foundation for evaluating
+                           "would we have made CLV on the games we passed
+                           on?" — needed for the gap-aware paper-trade test.
+  paper_trade.py           Gap-aware EV threshold harness. Defines the
+                           gap-aware formula and the logs/paper_trade.csv
+                           schema. Called from main.py to log what the
+                           gap-aware rule WOULD have decided each game,
+                           alongside the live decision. Logging only — does
+                           not change bot behavior.
+  fill_all_outcomes.py     Daily cron job that fills home_win for every
+                           analyzed game in daily_stats.csv (not just
+                           placed bets) by querying MLB Stats API. Output
+                           to logs/all_games_outcomes.csv. Idempotent.
+                           Required for end-of-60-day paper-trade analysis.
   daily_stats.py           Per-game decision diagnostics written to
                            logs/daily_stats.csv. Answers "why isn't the bot
                            betting?" without grepping session logs.
@@ -139,6 +172,16 @@ losses in a row would zero the bankroll — risk is real and acknowledged.
     cron.log                    Aggregated cron job output (append-only).
     ledger.csv                  Bet history (24 columns).
     daily_stats.csv             Per-game decision diagnostics (23 columns).
+    paper_trade.csv             Gap-aware-threshold paper-trade decisions
+                                (one row per analyzed game with Pinnacle).
+    all_games_clv.csv           Per-snapshot Pinnacle home_prob for every
+                                analyzed game (foundation for evaluating
+                                paper-trade outcomes).
+    all_games_outcomes.csv      home_win + final score for every analyzed
+                                game, from MLB Stats API. Filled daily by
+                                fill_all_outcomes.py.
+    calibration_2024.csv        2024 holdout (date, teams, predicted_p, won).
+    calibration_2025.csv        2025 holdout (same).
 
   .env                     KALSHI_KEY_ID, ODDS_API_KEY. chmod 600.
   requirements.txt         Python deps.
@@ -275,34 +318,41 @@ STATIC THRESHOLDS:
                                    hierarchy when only model signal available)
   CONFIDENCE_THRESHOLD  = 0.55   — model-only: stronger side must clear this
 
-MODEL-PINNACLE GAP VETO:
-  MODEL_PINNACLE_GAP_MAX = 0.20
+MODEL-PINNACLE GAP CIRCUIT BREAKER:
+  MODEL_PINNACLE_GAP_MAX = 0.50
 
-  If |p_model_home − p_pinnacle_home| > 20%, skip the game entirely. Assumes
-  Pinnacle knows something the model doesn't (scratch, lineup, weather,
-  bullpen). Safer to sit out than trust either signal alone.
+  If |p_model_home − p_pinnacle_home| > 50%, skip the game. This is a data-
+  quality sanity threshold for catastrophic model failure (e.g., feature
+  pipeline bug producing wild predictions), NOT a forecast-quality gate.
+  Set far outside any historical legitimate disagreement — observed gaps in
+  2024-2025 backfill data top out around 38pp, with reliable Pinnacle wins
+  through that range (see analysis/inversion_check.py for the H2H accuracy
+  curve by gap bucket). Was 0.20 prior to 2026-05-01.
 
-MODEL VETO ON PINNACLE BETS:
-  When a Pinnacle-sourced bet would fire, also require model_p for the bet
-  side to be ≥ Kalshi ask. Catches cases where Pinnacle's price already
-  reflects breaking news the model didn't see — we'd be buying stale edge.
+(REMOVED 2026-05-01) MODEL VETO ON PINNACLE BETS:
+  Previously required model_p for the bet side to be ≥ Kalshi ask. Removed
+  because the CLV backtest showed the model is anti-calibrated specifically
+  on disagreement games — when model and blend picked opposite sides at
+  ≥10pp gap, blend won 59-85% of head-to-head depending on gap size. The
+  veto was rejecting the bot's most reliable Pinnacle bets.
 
 GATES IN ORDER, PER GAME:
-  1. already have position           → skip (reason=already-positioned)
-  2. team stats missing              → skip (reason=missing-stats)
-  3. model-Pinnacle gap > 20%        → skip (reason=model-pin-gap)
-  4. no Pinnacle + confidence < 55%  → skip (reason=confidence-gate)
-  5. no Kalshi orderbook             → skip (reason=no-orderbook)
-  6. no side clears EV threshold     → skip (reason=no-edge)
-  7. winning side's model_p < ask    → skip (reason=model-veto-{home,away})
-  8. available_cash < unit floor     → skip (reason=insufficient-cash)
-  9. place_order returned falsy      → skip (reason=place-failed)
- 10. otherwise                       → placed (reason=placed)
+  1. already have position             → skip (reason=already-positioned)
+  2. team stats missing                → skip (reason=missing-stats)
+  3. model-Pinnacle gap > 50% breaker  → skip (reason=model-pin-gap)
+  4. no Pinnacle + confidence < 55%    → skip (reason=confidence-gate)
+  5. no Kalshi orderbook               → skip (reason=no-orderbook)
+  6. no side clears EV threshold       → skip (reason=no-edge)
+  7. available_cash < unit floor       → skip (reason=insufficient-cash)
+  8. place_order returned falsy        → skip (reason=place-failed)
+  9. otherwise                         → placed (reason=placed)
 
 (Gates 8 "session-cap" and 9 "kelly-zero" from the prior version were
 removed with the Kelly system on 2026-04-27. Insufficient-cash now subsumes
 both — it fires when this-session resting orders have exhausted bankroll
 below the next $10 unit.)
+
+(Gate 7 "model_p < ask" veto removed 2026-05-01 — see above.)
 
 
 ╔═════════════════════════════════════════════════════════════════════════════╗
@@ -438,9 +488,15 @@ model_p_home, pin_home_prob, pin_src, pin_std, model_pin_gap, ev_threshold,
 kalshi_home_ask, kalshi_away_ask, ev_home_net, ev_away_net, best_ev, reason,
 bet_contracts, bet_price, bet_cost, order_id.
 
-Reason values (see gates order in §6): placed, no-edge, model-veto-home,
-model-veto-away, model-pin-gap, confidence-gate, missing-stats, no-orderbook,
-insufficient-cash, already-positioned, place-failed.
+Reason values (see gates order in §6): placed, no-edge, model-pin-gap (now
+fires only on >50pp gap as a circuit breaker), confidence-gate, missing-stats,
+no-orderbook, insufficient-cash, already-positioned, place-failed.
+
+DEPRECATED as of 2026-05-01: model-veto-home, model-veto-away. Historical
+rows in daily_stats.csv may contain these reason codes but they will not
+appear in new rows. The directional model veto was removed because the
+CLV backtest showed the model is anti-calibrated specifically on the games
+where it disagreed directionally with Pinnacle.
 
 Purpose: after a week of runs, answer diagnostically:
   - Distribution of best_ev across rejected games
@@ -469,12 +525,12 @@ LOCAL (Windows):
   runs silently poisoned the pitcher cache once; native Windows avoids it.
 
 SERVER (Ubuntu 24.04 droplet, DigitalOcean):
-  Host:            Cortex @ <DROPLET_IP>
+  Host:            Cortex @ 24.199.107.79
   OS:              Ubuntu 24.04.3 LTS, timezone America/New_York
   Project path:    /opt/mlb-kalshi-bot
   Service user:    kalshi (uid 1001)
   Python env:      /opt/mlb-kalshi-bot/venv (Python 3.12.3)
-  SSH access:      ssh -i "~/.ssh/<deploy-key>" root@<DROPLET_IP>
+  SSH access:      ssh -i "C:\Users\maxxw\.ssh\kalshi_deploy" root@24.199.107.79
 
   Note: this server can host multiple bots. Convention for additional bots:
   install to /opt/<bot-name>/, service user <bot-name>, venv at
@@ -486,13 +542,13 @@ SYNCING LOCAL → SERVER (tar-piped over ssh, excludes pycache/logs/pkl backups)
     --exclude='logs/bot_*.log' \
     --exclude='models/xgb_model.pre_sp.pkl' \
     --exclude='models/xgb_model.sp_v1.pkl' . | \
-  ssh -i ~/.ssh/<deploy-key> root@<DROPLET_IP> \
+  ssh -i /c/Users/maxxw/.ssh/kalshi_deploy root@24.199.107.79 \
     'tar xzf - -C /opt/mlb-kalshi-bot && chown -R kalshi:kalshi /opt/mlb-kalshi-bot'
 
 Single-file push:
-  scp -i ~/.ssh/<deploy-key> \
-    "<local-file>" root@<DROPLET_IP>:/tmp/ && \
-  ssh -i ~/.ssh/<deploy-key> root@<DROPLET_IP> \
+  scp -i /c/Users/maxxw/.ssh/kalshi_deploy \
+    "<local-file>" root@24.199.107.79:/tmp/ && \
+  ssh -i /c/Users/maxxw/.ssh/kalshi_deploy root@24.199.107.79 \
     "mv /tmp/<file> /opt/mlb-kalshi-bot/<path> && chown kalshi:kalshi ..."
 
 
@@ -506,12 +562,23 @@ Crontab installed for kalshi user (times are America/New_York):
   0 9 * * *        cd /opt/mlb-kalshi-bot && ./venv/bin/python main.py --watch
                    >> logs/cron.log 2>&1
 
-  # CLV snapshot — every 5 min during game window
+  # CLV snapshot — every 5 min during game window (placed bets only)
   */5 11-23 * * *  cd /opt/mlb-kalshi-bot && ./venv/bin/python clv_snapshot.py
+                   >> logs/cron.log 2>&1
+
+  # All-analyzed-games CLV snapshot (added 2026-05-01) — captures Pinnacle
+  # close for every game the bot analyzed today, including rejected ones.
+  # Foundation for forward-looking evaluation of the gap-aware paper-trade.
+  */5 11-23 * * *  cd /opt/mlb-kalshi-bot && ./venv/bin/python snapshot_all_analyzed.py
                    >> logs/cron.log 2>&1
 
   # Overnight settlement + performance summary
   0 2 * * *        cd /opt/mlb-kalshi-bot && ./venv/bin/python settle.py
+                   >> logs/cron.log 2>&1
+
+  # 3:00 AM ET (after settle.py) — fill outcomes for ALL analyzed games
+  # via MLB Stats API. Foundation for paper-trade CLV evaluation.
+  0 3 * * *        cd /opt/mlb-kalshi-bot && ./venv/bin/python fill_all_outcomes.py
                    >> logs/cron.log 2>&1
 
 View: ssh in, then `crontab -u kalshi -l` or
@@ -524,7 +591,7 @@ View: ssh in, then `crontab -u kalshi -l` or
 
   .env                                KALSHI_KEY_ID, ODDS_API_KEY   (chmod 600)
   credentials/kalshi_private_key.txt  Kalshi RSA private key         (chmod 600)
-  ~/.ssh/<deploy-key>                 Server SSH key (local-only)
+  ~/.ssh/kalshi_deploy                Claude's server SSH key (local-only)
 
 The Kalshi private key is the only truly sensitive file in the project tree.
 On the server it's owned by kalshi:kalshi, perms 600. Do not scp it to /tmp
@@ -579,6 +646,31 @@ Next scheduled events:
 
 
 ╔═════════════════════════════════════════════════════════════════════════════╗
+║  15B. MANUAL ACTIVITY NOTE                                                  ║
+╚═════════════════════════════════════════════════════════════════════════════╝
+
+⚠️  USER PLACES MANUAL BETS & WITHDRAWALS INDEPENDENTLY OF THE BOT
+
+The account balance and ledger may diverge from expected values due to:
+  - User manually placing bets on Kalshi (e.g. sports betting on non-MLB events,
+    prop bets, other markets) that are NOT logged in ledger.csv
+  - User withdrawing cash from Kalshi to their bank account
+  - User depositing additional capital
+
+These manual activities are the SOURCE OF TRUTH. Always verify balance against:
+  1. Kalshi's live balance API (/portfolio/balance) — authoritative
+  2. Kalshi's account page transaction history — shows withdrawals/deposits
+  3. Settlement records via /portfolio/settlements — shows all bet outcomes
+
+DO NOT assume the difference between expected and actual balance is due to bot
+losses or fees. Check transaction history first.
+
+EXAMPLE: April 30, 2026 — balance dropped from $25.36 to $0.36 in a few hours
+with zero bot activity logged. User confirmed: manual Nuggets bet placed and
+lost. The $25 loss was user activity, not a bot glitch.
+
+
+╔═════════════════════════════════════════════════════════════════════════════╗
 ║  16. DEFERRED / PLANNED WORK                                                ║
 ╚═════════════════════════════════════════════════════════════════════════════╝
 
@@ -615,7 +707,7 @@ LOCAL:
 
 SERVER:
   SSH in:
-    ssh -i "~/.ssh/<deploy-key>" root@<DROPLET_IP>
+    ssh -i "C:\Users\maxxw\.ssh\kalshi_deploy" root@24.199.107.79
 
   Once SSH'd in:
     crontab -u kalshi -l                         # see scheduled jobs

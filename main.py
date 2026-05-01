@@ -40,6 +40,12 @@ from risk import calculate_ev, flat_unit_contracts
 from ledger import record_bet
 from watcher import watch_and_amend
 from daily_stats import new_game_stats, write_rows as write_daily_stats
+from paper_trade import (
+    new_paper_row,
+    gap_aware_threshold,
+    finalize_row as finalize_paper_row,
+    write_rows as write_paper_trade,
+)
 
 # Windows cmd defaults to cp1252; reconfigure stdout to UTF-8 so native runs
 # don't throw UnicodeEncodeError on our Δ / ─ / ≥ characters. File handler
@@ -150,6 +156,7 @@ def run(dry_run: bool = False, watch: bool = False) -> None:
     total_staked  = 0.0
     active_orders: list[dict] = []    # populated when watch mode is on
     daily_rows:    list[dict] = []    # per-game decision diagnostics
+    paper_rows:    list[dict] = []    # gap-aware-threshold paper-trade decisions
 
     for game in upcoming_games:
         home_code   = game['home_code']
@@ -327,44 +334,59 @@ def run(dry_run: bool = False, watch: bool = False) -> None:
         game_stats['ev_away_net'] = round(ev_away, 4)
         game_stats['best_ev']     = round(max(ev_home, ev_away), 4)
 
-        # Model veto: require model to also see the bet as +EV at ask price.
-        # Catches late-scratch / lineup news the books priced but the model missed.
-        model_p_away_val = 1.0 - model_p_home
-        model_ok_home = model_p_home     >= home_prices['yes_ask']
-        model_ok_away = model_p_away_val >= away_prices['yes_ask']
+        # ── Paper-trade harness: gap-aware EV threshold ──────────────────────
+        # Logging only. Runs alongside the live decision so we can compare
+        # realized CLV after 30-60 days. NOT a bot behavior change.
+        paper_row = None
+        if pinnacle:
+            ga_thresh = gap_aware_threshold(
+                config.EV_THRESHOLD_BASE, config.EV_THRESHOLD_CEIL,
+                float(prob_std), float(model_gap),
+            )
+            if ev_home >= ga_thresh and ev_home >= ev_away:
+                ga_decision = f'bet-{home_code}'
+            elif ev_away >= ga_thresh:
+                ga_decision = f'bet-{away_code}'
+            else:
+                ga_decision = 'no-edge'
+            paper_row = new_paper_row(
+                game_date=date.today(), away_code=away_code, home_code=home_code,
+                mode='dry-run' if dry_run else 'live',
+            )
+            paper_row['model_p_home']           = round(float(model_p_home), 4)
+            paper_row['pin_home_prob']          = round(float(p_home), 4)
+            paper_row['model_pin_gap']          = round(float(model_gap), 4)
+            paper_row['prob_std']               = round(float(prob_std), 4)
+            paper_row['kalshi_home_ask']        = float(home_prices['yes_ask'])
+            paper_row['kalshi_away_ask']        = float(away_prices['yes_ask'])
+            paper_row['ev_home_net']            = round(ev_home, 4)
+            paper_row['ev_away_net']            = round(ev_away, 4)
+            paper_row['ev_threshold_current']   = round(ev_threshold, 4)
+            paper_row['ev_threshold_gap_aware'] = round(ga_thresh, 4)
+            paper_row['decision_gap_aware']     = ga_decision
 
         # ── Pick best bet ────────────────────────────────────────────────────
         bet_ticker = bet_side = bet_ev = bet_price = bet_p = bet_label = None
         bet_team_code = None
         is_home_bet   = False
-        if ev_home >= ev_threshold and ev_home >= ev_away and model_ok_home:
+        if ev_home >= ev_threshold and ev_home >= ev_away:
             bet_ticker, bet_side  = home_ticker, 'yes'
             bet_ev, bet_price     = ev_home, home_prices['yes_ask']
             bet_p, bet_label      = p_home, f"{home_code} wins"
             bet_team_code, is_home_bet = home_code, True
-        elif ev_away >= ev_threshold and model_ok_away:
+        elif ev_away >= ev_threshold:
             bet_ticker, bet_side  = away_ticker, 'yes'
             bet_ev, bet_price     = ev_away, away_prices['yes_ask']
             bet_p, bet_label      = p_away, f"{away_code} wins"
             bet_team_code, is_home_bet = away_code, False
 
         if bet_ticker is None:
-            if ev_home >= ev_threshold and not model_ok_home and ev_home >= ev_away:
-                logger.info(
-                    f"Model veto: {home_code} YES EV={ev_home:+.1%} but "
-                    f"model_p={model_p_home:.1%} < ask={home_prices['yes_ask']:.2f} — skipping"
-                )
-                game_stats['reason'] = 'model-veto-home'
-            elif ev_away >= ev_threshold and not model_ok_away:
-                logger.info(
-                    f"Model veto: {away_code} YES EV={ev_away:+.1%} but "
-                    f"model_p={model_p_away_val:.1%} < ask={away_prices['yes_ask']:.2f} — skipping"
-                )
-                game_stats['reason'] = 'model-veto-away'
-            else:
-                logger.info(f"No edge — skipping {away_code} @ {home_code}")
-                game_stats['reason'] = 'no-edge'
+            logger.info(f"No edge — skipping {away_code} @ {home_code}")
+            game_stats['reason'] = 'no-edge'
             daily_rows.append(game_stats)
+            if paper_row is not None:
+                finalize_paper_row(paper_row, 'no-edge', None)
+                paper_rows.append(paper_row)
             continue
 
         # ── Flat-unit sizing ─────────────────────────────────────────────────
@@ -386,6 +408,9 @@ def run(dry_run: bool = False, watch: bool = False) -> None:
             logger.info(f"Insufficient cash for unit (avail=${available_cash:.2f}) — skipping")
             game_stats['reason'] = 'insufficient-cash'
             daily_rows.append(game_stats)
+            if paper_row is not None:
+                finalize_paper_row(paper_row, 'insufficient-cash', bet_team_code)
+                paper_rows.append(paper_row)
             continue
 
         logger.info(
@@ -466,6 +491,9 @@ def run(dry_run: bool = False, watch: bool = False) -> None:
             game_stats['bet_cost']      = round(cost, 2)
             game_stats['order_id']      = order_id
             daily_rows.append(game_stats)
+            if paper_row is not None:
+                finalize_paper_row(paper_row, 'placed', bet_team_code)
+                paper_rows.append(paper_row)
         else:
             # place_order returned falsy — API error, dry_run sentinel collision,
             # or Kalshi rejected. Log a stats row so we know this happened.
@@ -474,6 +502,9 @@ def run(dry_run: bool = False, watch: bool = False) -> None:
             game_stats['bet_price']     = float(bet_price)
             game_stats['bet_cost']      = round(cost, 2)
             daily_rows.append(game_stats)
+            if paper_row is not None:
+                finalize_paper_row(paper_row, 'place-failed', bet_team_code)
+                paper_rows.append(paper_row)
 
     # ── Session summary ──────────────────────────────────────────────────────
     logger.info(f"\n{'=' * 60}")
@@ -490,6 +521,10 @@ def run(dry_run: bool = False, watch: bool = False) -> None:
     if not dry_run and daily_rows:
         write_daily_stats(daily_rows)
         logger.info(f"daily_stats: wrote {len(daily_rows)} rows")
+    if not dry_run and paper_rows:
+        write_paper_trade(paper_rows)
+        n_changed = sum(1 for r in paper_rows if r.get('gap_aware_changed') == '1')
+        logger.info(f"paper_trade: wrote {len(paper_rows)} rows  ({n_changed} where gap-aware decision differs)")
 
     # ── Watch mode: re-evaluate resting orders until games start ─────────────
     if watch and active_orders:

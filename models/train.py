@@ -137,6 +137,66 @@ def train(start_year: int = 2015, end_year: int = 2025) -> None:
         acc = accuracy_score(y[test_mask][mask], (test_probs[mask] >= 0.5).astype(int))
         logger.info(f"  ≥{thr:.0%}: n={mask.sum():4d}  acc={acc:.3f}")
 
+    # ── Calibration on holdouts (post-isotonic, leakage-free) ────────────────
+    # The walk-forward model above is RAW XGBoost. Production uses isotonic-
+    # calibrated probabilities, so to evaluate the production-equivalent model
+    # we re-train with CalibratedClassifierCV on pre-holdout data and predict
+    # on the holdout. This tells us "when the model says 65%, do they actually
+    # win 65% of the time?"
+    #
+    # We do this for two holdout years (end_year - 1, end_year) to check
+    # whether calibration is stable across years. If 2024 and 2025 calibrate
+    # similarly, the diagnostic is robust. If they diverge meaningfully, the
+    # model's behavior is year-dependent — itself an important finding.
+    cal_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'logs')
+    os.makedirs(cal_dir, exist_ok=True)
+    bins = [(round(lo, 2), round(lo + 0.05, 2)) for lo in np.arange(0.0, 1.0, 0.05)]
+
+    for holdout_year in [end_year - 1, end_year]:
+        if holdout_year < start_year + 1:
+            continue  # need at least 1 prior year to train on
+        logger.info(f"\nCalibration on {holdout_year} holdout (post-isotonic, leakage-free)...")
+        h_tr_mask   = df['date'].apply(lambda d, y=holdout_year: d.year <  y)
+        h_test_mask = df['date'].apply(lambda d, y=holdout_year: d.year == y)
+        if h_test_mask.sum() < 100:
+            logger.warning(f"  Skipping {holdout_year} — only {h_test_mask.sum()} games in holdout")
+            continue
+
+        wf_cal = CalibratedClassifierCV(_make_model(), method='isotonic', cv=5)
+        wf_cal.fit(X[h_tr_mask], y[h_tr_mask])
+        cal_probs = wf_cal.predict_proba(X[h_test_mask])[:, 1]
+        y_test    = y[h_test_mask]
+
+        logger.info(f"  Train n={int(h_tr_mask.sum())}  Holdout n={int(h_test_mask.sum())}")
+        logger.info(f"  {'bin':<14}  {'n':>5}  {'mean_pred':>10}  {'win_rate':>10}  {'residual':>10}")
+        for lo, hi in bins:
+            mask = (cal_probs >= lo) & (cal_probs < hi)
+            n = int(mask.sum())
+            if n == 0:
+                continue
+            mean_pred = float(cal_probs[mask].mean())
+            win_rate  = float(y_test[mask].mean())
+            residual  = win_rate - mean_pred
+            logger.info(
+                f"  [{lo:.2f}, {hi:.2f})  {n:>5d}  {mean_pred:>10.3f}  "
+                f"{win_rate:>10.3f}  {residual:>+10.3f}"
+            )
+
+        brier = float(np.mean((cal_probs - y_test) ** 2))
+        logger.info(f"  Brier score: {brier:.4f}  (0.25 = always-50% baseline)")
+
+        cal_path = os.path.join(cal_dir, f'calibration_{holdout_year}.csv')
+        df_holdout = df[h_test_mask].reset_index(drop=True)
+        with open(cal_path, 'w', encoding='utf-8') as f:
+            f.write('date,home_team,away_team,predicted_p_home,actual_home_win\n')
+            for i in range(len(cal_probs)):
+                row = df_holdout.iloc[i]
+                date_str = row['date'].strftime('%Y-%m-%d') if hasattr(row['date'], 'strftime') else str(row['date'])
+                home = row.get('home_team', row.get('home_code', ''))
+                away = row.get('away_team', row.get('away_code', ''))
+                f.write(f"{date_str},{home},{away},{cal_probs[i]:.6f},{int(y_test[i])}\n")
+        logger.info(f"  Raw predictions saved → {cal_path}")
+
     # ── Train final model on ALL data ────────────────────────────────────────
     logger.info("\nTraining final model on full dataset...")
     base_model = _make_model()

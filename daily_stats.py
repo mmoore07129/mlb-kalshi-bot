@@ -27,10 +27,11 @@ FIELDNAMES = [
     'model_p_home', 'pin_home_prob', 'pin_src', 'pin_std', 'model_pin_gap',
     'ev_threshold', 'kalshi_home_ask', 'kalshi_away_ask',
     'ev_home_net', 'ev_away_net', 'best_ev',
-    'reason',  # placed | no-edge | model-veto-home | model-veto-away |
-               # model-pin-gap | confidence-gate | missing-stats |
-               # no-orderbook | kelly-zero | session-cap | already-positioned |
-               # place-failed
+    'reason',  # placed | no-edge | model-pin-gap | confidence-gate |
+               # missing-stats | no-orderbook | insufficient-cash |
+               # already-positioned | place-failed
+               # (deprecated, may appear in historical rows: model-veto-home,
+               # model-veto-away, kelly-zero, session-cap)
     'bet_contracts', 'bet_price', 'bet_cost', 'order_id',
 ]
 

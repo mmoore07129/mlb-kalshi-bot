@@ -42,10 +42,11 @@ EV_THRESHOLD_CEIL     = 0.08
 # Model confidence gate (only applies when Pinnacle unavailable).
 CONFIDENCE_THRESHOLD = 0.55
 
-# If Pinnacle disagrees with the model by more than this, skip the game.
-# A large gap means something Pinnacle knows that the model doesn't
-# (lineup scratch, weather, bullpen news) — safer to sit out.
-MODEL_PINNACLE_GAP_MAX = 0.20
+# Circuit breaker for catastrophic model failure (e.g., feature pipeline bug
+# producing wild predictions). Set far outside the legitimate forecast-
+# disagreement range; legitimate model-vs-book disagreements should be
+# allowed through to bet selection. Not a forecast-quality gate.
+MODEL_PINNACLE_GAP_MAX = 0.50
 
 # Watch mode: after placing orders, re-check orderbook + Pinnacle periodically
 # and amend resting orders if prices move materially.
