@@ -24,7 +24,7 @@ MLB_SEASON = 2026
 # edge size or bankroll. Simpler than Kelly and easier to reason about for a
 # small-bankroll data-collection phase. available_cash still gates (you can't
 # spend money you don't have), and depth still caps (don't walk the book).
-FLAT_UNIT_DOLLARS = 10.00  # Dollar size of every bet that passes the gate
+FLAT_UNIT_DOLLARS = 20.00  # Dollar size of every bet that passes the gate
 MIN_BET_DOLLARS   = 1.00   # Sanity floor — orders below this never go through
 
 # EV thresholds (net of fee — use net EV, not gross)

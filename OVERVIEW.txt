@@ -29,9 +29,9 @@ moneyline market. On each MLB game day it:
      following morning, logging realized PnL to the ledger.
 
 Kalshi is the ONLY venue. Only moneyline (KXMLBGAME) is supported — Kalshi
-doesn't list run line / totals / F5 / props for MLB. Sizing is a flat $10
-per qualifying bet, sized to the current ~$30 bankroll for a data-collection
-phase under the new 0.5% EV gate.
+doesn't list run line / totals / F5 / props for MLB. Sizing is a flat $20
+per qualifying bet (raised from $10 on 2026-05-01 alongside a planned
+deposit), under the 0.5% EV gate data-collection phase.
 
 
 ╔═════════════════════════════════════════════════════════════════════════════╗
@@ -81,8 +81,8 @@ correlation hypothesis: that high model-vs-market gap rows tend to also be
 the highest-EV ones. Individual 0.5% bets are nearly coin flips on expected
 value (calibration noise dominates the displayed edge), so this phase is
 explicitly a data-collection bet, not a high-confidence growth strategy.
-Expect ~1 bet per slate at this gate, $10 each, at $30 bankroll = three
-losses in a row would zero the bankroll — risk is real and acknowledged.
+Expect ~1 bet per slate at this gate, $20 each. Per-bet exposure scales
+with bankroll; small-bankroll loss-streak risk is real and acknowledged.
 
 
 ╔═════════════════════════════════════════════════════════════════════════════╗
@@ -273,19 +273,19 @@ FLAT-UNIT SIZING:
   cost      = contracts × ask_price
   (Returned by risk.flat_unit_contracts(); see also gates below.)
 
-  FLAT_UNIT_DOLLARS = 10.00.
+  FLAT_UNIT_DOLLARS = 20.00.  (was 10.00 from 2026-04-27 to 2026-05-01)
   Rationale for switching from 1/8 Kelly → flat unit (2026-04-27):
     - At low bankroll ($30), 1/8 Kelly stake on a 0.5% edge rounds to <$1 →
       MIN_BET_DOLLARS gate fires, bot never actually bets.
     - Flat unit is simpler to reason about; every passing bet is a known
-      $10 commitment. Useful for a data-collection phase.
+      $20 commitment. Useful for a data-collection phase.
     - Trade-off: per-bet exposure jumped from ≤10% of bankroll (Kelly cap)
       to 33% of bankroll. Three consecutive losses ≈ ruin. Expected to be
       revisited once bankroll grows or once the gap↔EV correlation is
       validated/refuted.
 
 ACTIVE GATES (applied around the unit):
-  MIN_BET_DOLLARS = 1.00   — sanity floor; effectively dead at $10 unit
+  MIN_BET_DOLLARS = 1.00   — sanity floor; effectively dead at $20 unit
   available_cash           — bankroll − this-session resting cost; can't
                              over-spend across multiple games per session
   depth_cap                = Kalshi top-of-book depth for chosen side
@@ -350,7 +350,7 @@ GATES IN ORDER, PER GAME:
 (Gates 8 "session-cap" and 9 "kelly-zero" from the prior version were
 removed with the Kelly system on 2026-04-27. Insufficient-cash now subsumes
 both — it fires when this-session resting orders have exhausted bankroll
-below the next $10 unit.)
+below the next $20 unit.)
 
 (Gate 7 "model_p < ask" veto removed 2026-05-01 — see above.)
 
@@ -608,7 +608,7 @@ Bankroll (live):              $29.40 reported by Kalshi at last session,
                               History: started 2026-04-23 deployment at
                               $113.65, user withdrew most of it on 2026-04-24/25,
                               redeposited $30 on 2026-04-27.
-Active config:                FLAT_UNIT_DOLLARS = 10.00
+Active config:                FLAT_UNIT_DOLLARS = 20.00 (raised 2026-05-01)
                               EV_THRESHOLD_BASE = 0.005 (0.5% floor)
                               PINNACLE_MIN_EV   = 0.005
                               MODEL_MIN_EV      = 0.08 (unchanged)
@@ -684,7 +684,7 @@ Not blocking the current run cadence, queued for future iterations:
   - Watch-mode CLV capture (cleaner T-0 snapshot vs. the 5-min cron approach)
   - Calibration bucket drift detector (bucket p_predicted vs. outcomes in
     5pp bins; pause + audit when drift exceeds tolerance)
-  - Drawdown governor (flat-unit version): halve unit ($10→$5) at -15% from
+  - Drawdown governor (flat-unit version): halve unit ($20→$10) at -15% from
     a high-water mark, pause + audit at -25%. Especially relevant under the
     aggressive 33%-of-bankroll-per-bet exposure profile.
   - Edge-bucket CLV unlock: data-driven per-bucket threshold tuning after
