@@ -41,3 +41,5 @@ keeps the model alive. These criteria are the contract.
   on THIS subset, not vs all-game home_win_rate).
 
 Signed: Claude Code (Opus 4.7 max) on behalf of mmoore07129.
+
+2026-05-02 correction: the prior session's handoff incorrectly described the COL bet as model-fallback. It was Pinnacle-primary. The intended filter is prob_src == 'Pinnacle', which includes COL.
